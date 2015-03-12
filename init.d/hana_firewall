@@ -1,0 +1,56 @@
+#! /bin/sh
+### BEGIN INIT INFO
+# Provides:          hana_firewall
+# Required-Start:    $network 
+# Required-Stop:     $network
+# Default-Start:     3 5
+# Default-Stop:
+# Short-Description: SAP HANA Firewall Service
+# Description:       SUSE firewall service for SAP HANA systems
+### END INIT INFO
+
+HANA_FIREWALL_BIN=/sbin/hana_firewall
+test -x $HANA_FIREWALL_BIN || exit 5
+
+. /etc/rc.status
+rc_reset
+
+case "$1" in
+	start)
+		echo -n "Starting HANA firewall "
+		$HANA_FIREWALL_BIN --quiet start
+		rc_status -v
+		;;
+	stop)
+		echo -n "Shutting down HANA firewall "
+		$HANA_FIREWALL_BIN --quiet stop
+		rc_status -v
+		;;
+	restart)
+		$HANA_FIREWALL_BIN --quiet restart 
+		rc_status
+		;;
+	reload)
+		echo -n "Reloading HANA firewall rules "
+		$HANA_FIREWALL_BIN --quiet reload
+		rc_status -v
+		;;
+	status)
+		echo -n "Checking for HANA firewall: "
+		$HANA_FIREWALL_BIN --quiet status
+		rc_status -v
+		;;
+	simulate)
+		echo -n "Simulate HANA firewall start"
+		$HANA_FIREWALL_BIN --simulate start
+		;;
+	show)
+		echo -n "Show iptable rules"
+		$HANA_FIREWALL_BIN show
+		;;
+	*)
+		echo "Usage: $0 {start|stop|status|restart|simulate|show|reload}"
+		echo "For more options and better output, call $HANA_FIREWALL_BIN directly!"
+		exit 1
+		;;
+esac

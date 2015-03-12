@@ -1,0 +1,13 @@
+## Name: HIGH_AVAILABILITY
+## Description: HAE
+## 21.11.2014, Ralph Roth
+
+# corosync, unicast, HAWK
+TCP="5404:5408 5560 7630"
+# corosync, multicast
+UDP="5404:5407 15219 56052"
+
+# hawk               7630/tcp     # HA Web Konsole  [Tim_Serong]
+# csync2
+# mgmtd - 5560 ?
+# corosync?

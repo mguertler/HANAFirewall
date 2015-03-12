@@ -1,0 +1,81 @@
+#!/usr/bin/perl
+#
+# Little script to add a new service
+# Written by Markus Guertler
+# SUSE @ SAP Linux Lab
+# GPL
+
+use warnings;
+use strict;
+
+my ($name,$desc,$udp_ports,$tcp_ports,$answ);
+
+print "\n\n";
+print "Create new user defined firewall service\n";
+print "----------------------------------------\n\n";
+
+while (not defined $answ or $answ ne 'y')
+{
+	print "* Please enter a name of the new service (i.e. Backup Service)\nName: ";
+	$name = <STDIN>;
+	chomp ($name);
+	
+	print "\n* Please enter a short description (one line) of your service\nDescription: ";
+	$desc = <STDIN>;
+	chomp ($desc);
+	
+	print <<EOF;
+
+* Please enter a space separated list of allowed TCP ports for this service.
+You can also enter a portrange in the format <start_port>:<end_port>
+
+Example: 22 1000:2000 4711
+	 
+EOF
+	print "TCP Ports: ";
+	$tcp_ports = <STDIN>;
+	chomp ($tcp_ports);
+	
+	print <<EOF;
+
+* Please enter a space separated list of allowed UDP ports for this service.
+You can also enter a portrange in the format <start_port>:<end_port>
+
+Example: 22 1000:2000 4711
+ 
+EOF
+	print "UDP Ports: ";
+	$udp_ports = <STDIN>;
+	chomp ($udp_ports);
+	
+	print "\n\n";
+	print "Summary:\n";
+	print "--------\n\n";
+	print "Name:		$name\n";
+	print "Description:	$desc\n";
+	print "TCP Ports:	$tcp_ports\n";
+	print "UDP Ports:	$udp_ports\n";
+	
+	print "\nAre these settings correct (y/n)? ";
+	$answ = <STDIN>;
+	chomp $answ;	
+}
+
+my $file = $name;
+$file =~ s/\s|\t/_/g;
+$file = uc($file);
+
+print "\n\nCreating new service: $file\n\n";
+
+die "$file already exists! Not creating new service." if (-e $file);
+
+open FILE, "> $file" or die ("Couldn't open $file for writing!");
+print FILE <<EOF;
+## Name: $name
+## Description: $desc
+TCP="$tcp_ports"
+UDP="$udp_ports"
+EOF
+close FILE;
+
+print "Done. Your service can now be used in the hana_firewall configuration file.\n\n";

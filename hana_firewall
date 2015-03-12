@@ -1,0 +1,626 @@
+#!/usr/bin/perl
+#
+# Script that creates a firewall for SAP HANA
+# - Uses iptables
+# - Uses hana_firewall_* configuration files in /etc/sysconfig
+# - Contains a logic to work with multiple HANA instances
+#
+# Written by Markus Guertler
+# SUSE @ SAP Linux Lab
+# License: GPL
+#
+
+our $VERSION="0.9";
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use Switch;
+use Sys::Syslog;
+
+#
+# Main
+#
+
+# Global variables
+my %opts; # Options
+#my $iptables_cmd = '/sbin/iptables';
+my $iptables_cmd = '/usr/sbin/iptables';
+&error ("Couldn't find $iptables_cmd executable!") if (! -x $iptables_cmd);
+my $ip_cmd = '/sbin/ip';
+&error ("Couldn't find $ip_cmd executable!") if (! -x $ip_cmd);
+
+my $config_dir = '/etc/sysconfig';
+my $hana_firewall_d_dir = 'hana_firewall.d';
+my $config_file_settings = 'hana_firewall';
+
+my $config; # Data structure with parsed and syntax-checked configuration
+my $mappings; # Data structure with interface -> port mappings
+
+# Get and store list of all network interfaces
+my @all_interfaces = &_get_all_interfaces; # List with all network interfaces
+
+# GetOpts parser
+my $p = Getopt::Long::Parser->new();
+$p->getoptions(
+	\%opts,
+	'simulate|s',
+	'debug|d',
+	'config_dir|c=s',
+	'help|h',
+	'quiet|q',
+	'show|w',
+	);
+
+# Action
+my $action = shift(@ARGV);
+
+if( !($action ~~ ['start','stop','status','restart','reload','show']) or $opts{help})
+{
+  print <<EOF;
+  
+usage: $0 [--simulate|-s] [--debug|-d] [--config_dir|-c <configuration directory>] [--quiet|q] [--help|-h] <start|stop|restart|reload|show|status>
+
+    --simulate|-s    Doesn't execute iptables commands, but dumps them to STDOUT
+    --config_dir|-c  Configuration directory
+    --debug|-d       Print debug messages
+    --quiet|-q       Be quiet on STDOUT, just log to syslog
+    --help|-h        Print this usage description
+
+Example: $0 --simulate start
+	
+EOF
+
+exit 1
+};
+
+# Check for root user
+&check_root;
+
+# Change config dir to manual specified string, if applicable
+$config_dir = $opts{config_dir} if ($opts{config_dir});
+
+# Read configuration files and built internal configuration structure
+&create_config_structure;
+
+# Create interface -> port mappings
+&create_interface_port_mappings;
+
+# Perform action start/stop/restart/status
+switch ($action)
+{
+	case "start"
+	{
+		if (&check_firewall_running and !$opts{simulate})
+		{
+			&out ("Firewall already running.");
+		} else
+		{
+			&setup_iptables_rules;	
+		}
+	}
+	case "stop"
+	{
+		&flush_iptables_rules;
+	}
+	case ["restart","reload"]
+	{
+		&flush_iptables_rules;
+		&setup_iptables_rules;
+	}
+	case "status"
+	{
+		if (&check_firewall_running)
+		{
+			&out("Firewall is running.");
+		} else
+		{
+			&out("Firewall is NOT running.");
+			exit 255;
+		}
+	}
+	case "show"
+	{
+		&show_iptables;
+	}
+}
+
+exit 0;
+
+#
+# Subroutines
+#
+
+sub create_config_structure
+{	
+	&debug("* Reading configuration files...");
+	#
+	# 1. Process global settings from file hana_firewall_settings
+	#
+	
+	# read config
+	my $config_hash_ref = &_read_config_file($config_dir.'/'.$config_file_settings);
+	
+	# create structure
+	foreach my $key (keys %$config_hash_ref)
+	{
+		my $value = $config_hash_ref->{$key};
+		switch ($key)
+		{
+			case "OPEN_ALL_SSH"
+			{
+				$value = lc($value);
+				&error ("$key must be set to 'yes' or 'no'!") if (!($value ~~ ['yes','no']));
+				$config->{settings}->{open_all_ssh} = $config_hash_ref->{$key}
+			}
+			case "ENABLE_LOGGING"
+			{
+				$value = lc($value);
+				&error ("$key must be set to 'yes' or 'no'!") if (!($value ~~ ['yes','no']));
+				$config->{settings}->{enable_logging} = $config_hash_ref->{$key}
+			}
+			case "HANA_SYSTEMS"
+			{
+				my @systems = split (/\s+/,$value);
+				# Check HANA_SYSTEM names
+				foreach (@systems)
+				{
+					&error ("$key contains an invalid HANA system name: $_",2) if ($_ !~ /[A-Z0-9]{3,3}\d{2,2}/);
+				}
+				# TBD: Check if HANA systems really exists!
+				&error("$key must contain at least one HANA system in the format <SID><INSTANCE_NR>!",2) if (!@systems);
+				$config->{settings}->{hana_systems} = \@systems;
+			}
+			case /^INTERFACE_\d+$/
+			{
+				if ($value)
+				{
+					$key =~ /^INTERFACE_(\d+)/;
+					&error ("Interface $value doesn't exist on the system!") if (!($value ~~ @all_interfaces));
+					$config->{settings}->{interface}->{$1}->{name}=$value;						
+				}
+			}
+			case /^INTERFACE_\d+_SERVICES$/
+			{
+				if ($value)
+				{
+					$key =~ /^INTERFACE_(\d+)/;
+					my @services = split (/\s+/,$value);
+					$config->{settings}->{interface}->{$1}->{services}=\@services;	
+				}
+			}
+			else 
+			{
+				&error("Parameter $key has an invalid name! Maybe a spelling mistake?",2)
+			}
+		}
+	}
+	
+	#
+	# 2. Process HANA servoces and user services from hana_firewall.d directory
+	#
+	my $full_hana_firewall_d_dir = $config_dir.'/'.$hana_firewall_d_dir;
+	opendir (DIR, $full_hana_firewall_d_dir) or &error ("Couldn't open directory $full_hana_firewall_d_dir");
+	while (my $file = readdir DIR)
+	{
+		next if ($file =~ m/^\./ or $file =~ /^create_new_service$/);
+		my $file_path = $full_hana_firewall_d_dir."/".$file;
+		&_create_service_in_config_structure($file,$file_path);
+	}
+	closedir (DIR);
+	
+	#
+	# 3. Post validation checks of the config data structure
+	#
+	
+	# Validate interface names and service names
+	my $count;
+	foreach my $iface_name (keys %{$config->{settings}->{interface}})
+	{
+		my $iface = $config->{settings}->{interface}->{$iface_name};
+		# Interface names
+		&error("No interface name specified for interface number: ".$count) if (!$iface->{name});
+		
+		my $found;
+		foreach (@all_interfaces)
+		{
+			$found = 1 if ($_ eq $iface->{name});
+		}
+		close CMD;
+		&error("Interface $iface->{name} not found or not configured on this system!",2) if (!$found);
+		
+		&error("No services specified for interface $iface->{name}",2) if (! defined @{$iface->{services}});
+		
+		# Service names
+		foreach my $service (@{$iface->{services}})
+		{
+			my($service_name,$network) = split(/:/,$service);
+			&error("Service name $service for interface $iface->{name} could neither be found in directories $full_hana_firewall_d_dir/ nor in /etc/services!")
+				if (!defined &_translate_service($service_name));
+			&error("Network $network for service $service_name, defined for interface $iface->{name} in wrong format") if ($network and $network !~ /\d+\.\d+\.\d+\.\d+\/?\d*/);
+		}
+		
+		$count++;
+		
+	}
+	
+	# Dump data structure if debugging is enabled
+	&debug ("Configuration data structure: \n".Dumper($config));
+		
+}
+
+# Creates services in config structure
+# Expects:
+# * Service name (string)
+# * reference to config hash (from _read_config_file)
+# * full path & filename of config file (string)
+sub _create_service_in_config_structure
+{
+	my $service_name = shift;
+	my $file_path = shift;
+	
+	# Read & parse the service file
+	my $config_hash_ref = &_read_config_file($file_path);
+	
+	# Cycle through the config hash and add the service as well as the tcp and udp ports
+	foreach my $key (keys %$config_hash_ref)
+	{
+		my $value = $config_hash_ref->{$key};
+		switch ($key)
+		{
+			case ["TCP","UDP"]
+			{
+				my @ports = split(/\s+/,$value);
+				foreach (@ports)
+				{
+					&error ("Port description $_ in wrong format for service $key in file $file_path!") if ($_ !~ /^(\d+|__INST_NUM\+?1?__)+(:(\d+|__INST_NUM\+?1?__)+)?$/);
+				}
+				$config->{services}->{$service_name}->{tcp}=\@ports if ($key eq "TCP");
+				$config->{services}->{$service_name}->{udp}=\@ports if ($key eq "UDP");
+			}
+			else 
+			{
+				&error("Parameter $key has an invalid name in file $file_path! Maybe a spelling mistake?",2)
+			}
+		}
+	}
+}
+
+# Reads and parses configuration file $file
+# Expects: filename
+# Returns: reference to a hash structure with configuration parameters and raw values as they occur in the config file
+sub _read_config_file
+{
+	my $file = shift;
+	my %config_hash;
+	
+	my ($line);
+	open FILE, "<".$file or &error("Couldn't open config file $file for reading!",2);
+
+	while (<FILE>)
+	{
+		$line++;
+		chomp ($_);
+		next if ($_ =~ /^#/ || $_ =~ /^\s*$/);
+		if ($_ !~ /^\s*([A-Z0-9_]+)=\"(.*)\"\s*/)
+		{
+			&error ("Syntax error in config file $file near line $line!",2);
+		}
+		
+		$config_hash{$1}=$2;
+	}
+	close FILE;
+	return (\%config_hash);
+}
+
+# Looks up a service from /etc/services or a manual specified service and translates it into a TCP & UDP ports
+# Expects: $service_name
+# Returns: reference to array @tcp_ports, reference to array @udp_ports
+sub _translate_service
+{
+	my $service_name = shift;
+	my (@tcp_ports,@udp_ports);
+	#
+	# 1. Do an lookup for a internal defined service
+	#
+	foreach my $predefined_service (keys %{$config->{services}})
+	{
+		# If service_name exists in configuration or service name eq to 'HANA_*' and current service is a HANA service 
+		if ($service_name eq $predefined_service or ($service_name eq "HANA_*" and $predefined_service =~ /^HANA_.+$/))
+		{
+			my $subs_tcp_ports_ref = &_substitute_instance_number_placeholders($config->{services}->{$predefined_service}->{tcp});
+			push(@tcp_ports,@$subs_tcp_ports_ref);
+			my $subs_udp_ports_ref = &_substitute_instance_number_placeholders($config->{services}->{$predefined_service}->{udp});
+			push(@udp_ports,@$subs_udp_ports_ref);
+		}
+	}
+	
+	#
+	# 2. Lookup service in /etc/services
+	#
+	my ($name, $aliases, $port_number, $protocol_name);
+	($name, $aliases, $port_number, $protocol_name) = getservbyname($service_name, "tcp");
+	push (@tcp_ports,$port_number) if ($port_number);
+	($name, $aliases, $port_number, $protocol_name) = getservbyname($service_name, "udp");
+	push (@udp_ports,$port_number) if ($port_number);
+	
+	# Return undef, if no ports have been found for this service name
+	return undef if (!(@tcp_ports or @udp_ports));
+	
+	# Return tcp and udp ports as references to arrays separately
+	return(\@tcp_ports,\@udp_ports);
+}
+
+# Substitutes instance number placeholders (__INST_NUM__ and __INST_NUM+1__) from service port definitions
+# and expand it to all defined HANA systems
+#
+# Expects: reference to list with unsubstituted ports
+# Returns: Array with substituted ports
+sub _substitute_instance_number_placeholders
+{
+	my $unsubstituted_port_ref = shift;
+	
+	my @substituted_ports;
+	
+	# Walk through each port entry for this service
+	foreach my $port (@$unsubstituted_port_ref)
+	{
+		# Subsitute instance number placeholders
+		if ($port =~ /__INST_NUM\+?1?__/)
+		{
+			# Expand instance numbers to all instance numbers of all hana systems
+			my @all_inst_nums = &_get_all_instance_numbers;
+			foreach my $inst_num (@all_inst_nums)
+			{
+				my $inst_num_plus_1;
+				$inst_num_plus_1 = sprintf ("%02d",$inst_num + 1);
+				my $port_subs = $port;
+				$port_subs =~ s/__INST_NUM__/$inst_num/g;
+				$port_subs =~ s/__INST_NUM\+1__/$inst_num_plus_1/g;
+				
+				push (@substituted_ports,$port_subs);
+			}
+		# Other ports & portranges are just taken over
+		} else
+		{
+			push (@substituted_ports,$port);
+		}
+	}
+	return (\@substituted_ports);
+}
+
+# Get an unique list of all instance numbers of all hana systems
+# Returns: Array with instance numbers
+sub _get_all_instance_numbers
+{
+	my @inst_nums;
+	foreach my $system (@{$config->{settings}->{hana_systems}})
+	{
+		$system =~ /\w{3,3}(\d{2,2})/;
+		push (@inst_nums,$1) if ($1);
+	}
+	
+	# Make list unique
+	my %seen=();
+	@inst_nums = grep { ! $seen{$_} ++ } @inst_nums;
+	
+	return (@inst_nums);
+}
+
+#
+# Map interfaces to port names
+# Populates $mappings data structure (dumped to stdout when debugging is enabled)
+sub create_interface_port_mappings
+{
+	&debug("Create interface / port mappings...");
+	foreach my $iface_name (keys %{$config->{settings}->{interface}})
+	{
+		my $iface = $config->{settings}->{interface}->{$iface_name};
+		&debug("Processing services for interface: $iface->{name}");
+		foreach my $service (@{$iface->{services}})
+		{
+			my($service_name,$network) = split(/:/,$service);
+			$network="0.0.0.0/0" if (!$network);
+			my ($tcp_ports, $udp_ports) = &_translate_service($service_name);
+			push (@{$mappings->{$iface->{name}}->{$network}->{tcp}},@$tcp_ports);
+			push (@{$mappings->{$iface->{name}}->{$network}->{udp}},@$udp_ports);	
+		}
+	}
+	&debug("Interface / port mappings:\n".Dumper($mappings));
+}
+
+#
+# Setup of the iptables rules using the iptables command
+sub setup_iptables_rules
+{
+	my @rules;
+	&out ("Setting up iptables rules...");
+	
+	#
+	# Allow loopback device connections
+	#
+	push (@rules,"$iptables_cmd -A INPUT -i lo -j ACCEPT");
+	
+	#
+	# Allow established connections
+	#
+	push (@rules,"$iptables_cmd -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT");
+	
+	#
+	# Allow incoming ICMP ping echo requests
+	#
+	push (@rules,"$iptables_cmd -A INPUT -p icmp --icmp-type 8 -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT");
+	
+	#
+	# Global SSH rule
+	#
+	if (defined $config->{settings}->{open_all_ssh} && $config->{settings}->{open_all_ssh} eq 'yes')
+	{
+		push (@rules,"$iptables_cmd -A INPUT -p tcp --dport 22 -j ACCEPT");
+	}
+	
+	#
+	# Identifier rule
+	#
+	push (@rules,"$iptables_cmd -N HANA_FIREWALL_IDENTIFIER");
+	
+	#
+	# Interface rules
+	#
+	my $target_prefix = "target_interface_";
+	foreach my $iface (keys %$mappings)
+	{
+		# Create jump target
+		push (@rules,"$iptables_cmd -N $target_prefix$iface");
+		# Create jump rule
+		push (@rules,"$iptables_cmd -A INPUT -i $iface -j $target_prefix$iface");
+		# For all networks...
+		foreach my $network (keys %{$mappings->{$iface}})
+		{
+			# extract TCP Ports
+			foreach my $port (@{$mappings->{$iface}->{$network}->{tcp}})
+			{
+				push (@rules,"$iptables_cmd -A $target_prefix$iface -i $iface -s $network -p tcp --dport $port -j ACCEPT");
+			}	
+			# extract UDP Ports
+			foreach my $port (@{$mappings->{$iface}->{$network}->{udp}})
+			{
+				push (@rules,"$iptables_cmd -A $target_prefix$iface -i $iface -s $network -p udp --dport $port -j ACCEPT");
+			}	
+		}
+	}
+	
+	#
+	# Log packages, that are sent to closed ports if logging is enabled
+	#
+	if (defined $config->{settings}->{enable_logging} && $config->{settings}->{enable_logging} eq 'yes')
+	{
+		push (@rules,"$iptables_cmd -A INPUT -m addrtype ! --dst-type BROADCAST -m addrtype ! --dst-type MULTICAST -m limit --limit 5/min --limit-burst 10 -j LOG --log-prefix 'HANA firewall drop: ' --log-level 4");
+	}
+	
+	#
+	# Drop everything rule
+	#
+	push (@rules,"$iptables_cmd -A INPUT -j DROP");
+	
+	&_execute_rules(@rules);
+		
+	return (undef);
+}
+
+#
+# Flushes all iptables rules
+sub flush_iptables_rules
+{
+	&out ("Flushing iptables rules...");
+	my @rules;
+	push (@rules,"$iptables_cmd -F");
+	push (@rules,"$iptables_cmd -X");
+	&_execute_rules(@rules);
+}
+
+#
+# Checks if firewall is running
+# Returns 1 if the firewall is running or undef if the firewall is not running
+sub check_firewall_running
+{
+	open IPTABLES, "$iptables_cmd -L -v -n |" or &error ("Couldn't execute command $iptables_cmd -L -v");
+	my $running;
+	while (<IPTABLES>)
+	{
+		chomp $_;
+		$running = 1 if ($_ =~ /HANA_FIREWALL_IDENTIFIER/);
+	}
+	close IPTABLES;
+	return ($running);
+}
+
+# Dumps iptable rules to STDOUT
+sub show_iptables
+{
+	system "$iptables_cmd -L -n -v";
+	if ($? > 0)
+	{
+		&error("Error while trying to show iptable rules");
+	}
+}
+
+# Executes a list of iptables rules
+# Expects: Array with rules (one iptable rule per list element)
+# Returns: undef on success
+sub _execute_rules
+{
+	my @rules = @_;
+	if ($opts{simulate})
+	{
+		&out("\nSimulate iptables setup. Just printing all iptable rules and not really setting them up...\n\n");
+		foreach my $rule (@rules)
+		{
+			&out("$rule");
+		}
+	} else
+	{
+		foreach my $rule (@rules)
+		{
+			system "$rule";
+			if ($? > 0)
+			{
+				&error("Error setting up iptables rules!\n\nFailed command: $rule");
+			}
+		}
+	}
+	return(undef);
+}
+
+# Get list of all network interfaces of the system
+# Reteurns: Array with interface names
+sub _get_all_interfaces
+{
+	my @interfaces;
+	open CMD, "$ip_cmd -o link show |" or &error("Couldn't execute command: $ip_cmd -o link show",2);
+	while (<CMD>)
+		{
+			push(@interfaces,$1) if ($_ =~ /^\d+:\s+([\w\-_]+):/); 
+		}
+	
+	return (@interfaces); 	
+}
+
+# Checks if command is running as root user
+# Prints error message and exits if command is not beeing executed as user root
+sub check_root
+{
+	if ( $< != 0 )
+	{
+		&error("This command must be executed as user root!",2); 
+	}	
+}
+
+# Prints messages to stdout if option --quiet is not set
+# Expects: $message
+sub out
+{
+	my $msg = shift;
+	print "$msg\n" if (!$opts{quiet});
+	syslog ('info',$msg);
+}
+
+# Prints error message and exits
+# Expects: $error_message and optional $exit_code
+sub error
+{
+	my $error = shift;
+	my $exitcode = shift || 1;
+	print STDERR $error."\n" if (!$opts{quiet});
+	syslog ('err',$error);
+	exit $exitcode;
+}
+
+# Prints debug message if debug option is set
+# Expects: $debug message
+sub debug
+{
+	my $msg = shift;
+	print STDOUT "$msg\n" if ($opts{debug});
+}
