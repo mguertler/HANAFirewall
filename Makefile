@@ -2,7 +2,7 @@
 VERSION	= $(shell cat VERSION)
 PACKAGE	=HANA-Firewall
 DIR	=$(PACKAGE)-$(VERSION)
-SUBS	=hana_firewall init.d sysconfig
+SUBS	=hana_firewall init.d sysconfig Makefile
 
 install: install_bin install_config
 
