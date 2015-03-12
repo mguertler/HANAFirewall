@@ -45,7 +45,7 @@ Authors:
 %post
 
 %install
-make install
+make DESTDIR=%{buildroot} install
 
 %files
 %dir /etc/sysconfig/hana_firewall.d
