@@ -1,4 +1,8 @@
 # 21.11.2014, rr
+VERSION	= $(shell cat VERSION)
+PACKAGE	=HANA-Firewall
+DIR	=$(PACKAGE)-$(VERSION)
+SUBS	=hana_firewall init.d sysconfig
 
 install: install_bin install_config
 
@@ -24,4 +28,9 @@ install_config:
 	install -m 640 sysconfig/hana_firewall.d/NFS_SERVER $(DESTDIR)/etc/sysconfig/hana_firewall.d
 	install -m 640 sysconfig/hana_firewall.d/HANA_HIGH_AVAILABILITY $(DESTDIR)/etc/sysconfig/hana_firewall.d
 
-
+dist:
+	if [ -e $(DIR) ] ;  then rm -rf $(DIR) ; fi  
+	mkdir $(DIR)
+	for i in $(SUBS); do /bin/ln -s ../$$i $(DIR)/$$i; done
+	tar hjcvpf $(DIR).tar.bz2 $(DIR)
+	sed    s/@VERSION@/$(VERSION)/  $(PACKAGE).spec.in > $(PACKAGE).spec
