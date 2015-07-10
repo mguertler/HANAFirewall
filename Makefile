@@ -1,4 +1,5 @@
-# 21.11.2014, rr
+# 21.11.2014, rr += HANA_HIGH_AVAILABILITY
+# 09.07.2015, rr -- needs to be rechecked under SLES12
 
 install: install_bin install_config
 
