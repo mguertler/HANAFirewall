@@ -1,13 +1,23 @@
 ## Name: HIGH_AVAILABILITY
-## Description: HAE
+## Description: HAE/pacemaker
 ## 21.11.2014, Ralph Roth
+## 09.07.2015, Ralph Roth
+
+# > Firewall
+# > If your cluster nodes have a firewall configured, you will need to open
+# > the following ports:
+# >
+# >  TCP: 5560  mgmtd
+# >  UDP: 5404, 5405  // unicast/multicast? 1 Ring/2 Rings?
+# Unicast, 2 Rings, ports are not fix but defined in corosync.conf.
+# In the past each Ring has needed 2 ports, not only one.
+#
+# >  TCP: 21064 (if using DLM)
+# >  TCP: 30865 (if using csync2)
+# >  TCP: 7630 (if using the hawk web UI) # HA Web Konsole  [Tim_Serong]
+
 
 # corosync, unicast, HAWK
-TCP="5404:5408 5560 7630"
+TCP="5404:5408 5560 7630 21064 30865"
 # corosync, multicast
-UDP="5404:5407 15219 56052"
-
-# hawk               7630/tcp     # HA Web Konsole  [Tim_Serong]
-# csync2
-# mgmtd - 5560 ?
-# corosync?
+UDP="5404:5408 15219 56052"
